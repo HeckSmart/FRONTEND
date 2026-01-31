@@ -1,28 +1,23 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   MessageSquareOff,
   AlertTriangle,
   Gauge,
-  Clock,
-  AlertCircle,
   ChevronRight,
   Globe,
   Bot,
   ShieldAlert,
   CheckCircle2,
-  Send,
-  ArrowUpRight,
-  Database,
   Flame,
-  Timer,
   HelpCircle,
-  Filter,
-  X,
+  Loader2,
+  RefreshCw,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { fetchQueries, type ApiQuery } from "@/lib/queries-api";
 import {
   Card,
   CardContent,
@@ -56,17 +51,19 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Progress } from "@/components/ui/progress";
-import { Separator } from "@/components/ui/separator";
+import { Input } from "@/components/ui/input";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 
 // --- Types (aligned with your data model) ---
-type RiskTag = "normal" | "refund" | "fraud" | "safety";
+type RiskTag = "normal" | "refund" | "fraud" | "safety" | "highRisk";
 type FailureReason =
   | "Low intent confidence"
   | "Entity missing (station, date, battery ID)"
   | "Ambiguous query"
   | "Out-of-scope request"
-  | "Policy restricted (refund, SIM change)";
+  | "Policy restricted (refund, SIM change)"
+  | "Incomplete information provided"
+  | (string & {});
 
 export interface QueryRecord {
   id: string;
@@ -90,165 +87,31 @@ export interface QueryRecord {
   slaMinutesLeft?: number;
 }
 
-// --- Mock data ---
-const MOCK_QUERIES: QueryRecord[] = [
-  {
-    id: "1",
-    timestamp: new Date(Date.now() - 8 * 60 * 1000),
-    driverId: "DRV-2847",
-    driverName: "Ramesh K.",
-    language: "Hindi",
-    intentPredicted: "Check Swap History",
-    intentConfidence: 0.42,
-    entities: { date: "kal", station: "", battery_id: "" },
-    failureReason: "Entity missing (station, date, battery ID)",
-    riskTag: "normal",
-    rawText:
-      "Bhai kal wali swap ka paisa kaat liya, par app mein kuch dikh nahi raha",
-    translatedText:
-      "Bro, the money for yesterday's swap was deducted but I don't see anything in the app",
-    voiceConfidence: 0.88,
-    suggestedIntent: "Swap history + billing issue",
-    suggestedFollowUps: ["Which station?", "Exact date?"],
-    deepLinks: [
-      { label: "Open swap history", href: "#" },
-      { label: "Open billing ledger", href: "#" },
-    ],
-    slaBreach: false,
-    slaMinutesLeft: 22,
-  },
-  {
-    id: "2",
-    timestamp: new Date(Date.now() - 25 * 60 * 1000),
-    driverId: "DRV-1092",
-    driverName: "Priya S.",
-    language: "Tamil",
-    intentPredicted: "Refund Request",
-    intentConfidence: 0.31,
+function mapApiQueryToRecord(api: ApiQuery): QueryRecord {
+  const confidence = parseFloat(api.confidence) || 0;
+  const riskTag = (api.riskTag === "highRisk" ? "highRisk" : api.riskTag) as RiskTag;
+  return {
+    id: String(api.id),
+    timestamp: new Date(api.createdAt),
+    driverId: api.driverId,
+    driverName: api.driverId,
+    language: api.language.charAt(0).toUpperCase() + api.language.slice(1),
+    intentPredicted: api.intent.replace(/([A-Z])/g, " $1").trim() || api.intent,
+    intentConfidence: confidence,
     entities: {},
-    failureReason: "Policy restricted (refund, SIM change)",
-    riskTag: "refund",
-    riskScore: 72,
-    rawText: "Enakku refund venum, battery damage aachu",
-    translatedText: "I need a refund, the battery got damaged",
-    suggestedIntent: "Refund request",
-    slaBreach: true,
-    slaMinutesLeft: -5,
-  },
-  {
-    id: "3",
-    timestamp: new Date(Date.now() - 3 * 60 * 1000),
-    driverId: "DRV-5521",
-    driverName: "Vikram M.",
-    language: "Mix",
-    intentPredicted: "Unknown",
-    intentConfidence: 0.18,
-    entities: {},
-    failureReason: "Ambiguous query",
-    riskTag: "normal",
-    rawText: "Issue hai bhai",
-    translatedText: "There's an issue bro",
-    suggestedIntent: "General complaint — needs clarification",
-    suggestedFollowUps: ["What type of issue?", "Station or app?"],
-    slaBreach: false,
-    slaMinutesLeft: 27,
-  },
-  {
-    id: "4",
-    timestamp: new Date(Date.now() - 45 * 60 * 1000),
-    driverId: "DRV-8833",
-    driverName: "Anita R.",
-    language: "Hindi",
-    intentPredicted: "SIM Change",
-    intentConfidence: 0.55,
-    entities: {},
-    failureReason: "Policy restricted (refund, SIM change)",
-    riskTag: "fraud",
-    riskScore: 85,
-    rawText: "Mera SIM change karna hai",
-    translatedText: "I want to change my SIM",
-    slaBreach: false,
-    slaMinutesLeft: 0,
-  },
-  {
-    id: "5",
-    timestamp: new Date(Date.now() - 12 * 60 * 1000),
-    driverId: "DRV-4401",
-    driverName: "Suresh P.",
-    language: "Hindi",
-    intentPredicted: "Battery Booking",
-    intentConfidence: 0.38,
-    entities: { station: "Koramangala", date: "", battery_id: "" },
-    failureReason: "Entity missing (station, date, battery ID)",
-    riskTag: "normal",
-    rawText: "Kal subah battery book karni hai",
-    translatedText: "I need to book a battery tomorrow morning",
-    suggestedFollowUps: ["Exact date?", "Which slot?"],
-    slaBreach: false,
-    slaMinutesLeft: 18,
-  },
-];
+    failureReason: api.failureReason as FailureReason,
+    riskTag,
+    rawText: api.summary,
+    translatedText: undefined,
+    suggestedIntent: api.action === "escalated" ? "Escalated" : undefined,
+  };
+}
 
-// --- KPI summary (derived) ---
-const KPIS = [
-  {
-    key: "unresolved",
-    label: "Unresolved bot queries (Today)",
-    value: 24,
-    trend: "+3",
-    variant: "default" as const,
-    icon: MessageSquareOff,
-    colorClass: "from-violet-500/20 to-violet-600/5 border-violet-500/30 text-violet-600 dark:text-violet-400",
-    delay: 0,
-  },
-  {
-    key: "highRisk",
-    label: "High-risk / Escalated",
-    value: 5,
-    trend: "2 new",
-    variant: "destructive" as const,
-    icon: AlertTriangle,
-    colorClass: "from-amber-500/20 to-orange-600/5 border-amber-500/30 text-amber-600 dark:text-amber-400",
-    delay: 0.05,
-  },
-  {
-    key: "confidence",
-    label: "Avg bot confidence score",
-    value: "62%",
-    trend: "↓ 4%",
-    variant: "secondary" as const,
-    icon: Gauge,
-    colorClass: "from-emerald-500/20 to-emerald-600/5 border-emerald-500/30 text-emerald-600 dark:text-emerald-400",
-    delay: 0.1,
-  },
-  {
-    key: "aht",
-    label: "Avg handling time (AHT)",
-    value: "4m 32s",
-    trend: "−12s",
-    variant: "secondary" as const,
-    icon: Clock,
-    colorClass: "from-blue-500/20 to-blue-600/5 border-blue-500/30 text-blue-600 dark:text-blue-400",
-    delay: 0.15,
-  },
-  {
-    key: "sla",
-    label: "SLA breaches (live)",
-    value: 2,
-    trend: "Now",
-    variant: "destructive" as const,
-    icon: AlertCircle,
-    colorClass: "from-red-500/20 to-red-600/5 border-red-500/30 text-red-600 dark:text-red-400",
-    delay: 0.2,
-  },
-];
-
-// --- Smart view filters ---
+// --- Smart view filters (labels only; filter logic uses query data) ---
 const SMART_VIEWS = [
   { id: "all", label: "All", icon: MessageSquareOff },
   { id: "refund_risk", label: "Refund + High Risk", icon: Flame },
-  { id: "sla_breach", label: "SLA Breaching in 10 min", icon: Timer },
-  { id: "low_conf", label: "Bot totally clueless", icon: HelpCircle },
+  { id: "low_conf", label: "Low confidence", icon: HelpCircle },
 ];
 
 function formatTimeAgo(d: Date) {
@@ -260,7 +123,7 @@ function formatTimeAgo(d: Date) {
 }
 
 function getRiskBadgeVariant(tag: RiskTag): "default" | "secondary" | "destructive" | "outline" {
-  if (tag === "fraud" || tag === "safety") return "destructive";
+  if (tag === "fraud" || tag === "safety" || tag === "highRisk") return "destructive";
   if (tag === "refund") return "secondary";
   return "outline";
 }
@@ -276,24 +139,81 @@ export default function DashboardPage() {
   const [activeView, setActiveView] = useState("all");
   const [languageFilter, setLanguageFilter] = useState<string>("all");
   const [riskFilter, setRiskFilter] = useState<string>("all");
-  const [intentFilter, setIntentFilter] = useState<string>("all");
+  const [queries, setQueries] = useState<QueryRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [driverIdFilter, setDriverIdFilter] = useState("");
+
+  const loadQueries = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await fetchQueries(driverIdFilter.trim() || undefined);
+      setQueries(data.map(mapApiQueryToRecord));
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Failed to load queries";
+      setError(message);
+      setQueries([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [driverIdFilter]);
+
+  useEffect(() => {
+    loadQueries();
+  }, [loadQueries]);
 
   const filteredQueries = useMemo(() => {
-    let list = [...MOCK_QUERIES];
+    let list = [...queries];
     if (languageFilter !== "all")
       list = list.filter((q) => q.language.toLowerCase() === languageFilter.toLowerCase());
     if (riskFilter !== "all")
       list = list.filter((q) => q.riskTag === riskFilter);
-    if (intentFilter !== "all")
-      list = list.filter((q) => q.intentPredicted === intentFilter);
     if (activeView === "refund_risk")
-      list = list.filter((q) => (q.riskTag === "refund" || q.riskTag === "fraud") && (q.riskScore ?? 0) >= 50);
-    if (activeView === "sla_breach")
-      list = list.filter((q) => (q.slaMinutesLeft ?? 999) <= 10 && (q.slaMinutesLeft ?? 0) >= 0);
+      list = list.filter((q) => q.riskTag === "refund" || q.riskTag === "fraud" || q.riskTag === "highRisk");
     if (activeView === "low_conf")
       list = list.filter((q) => q.intentConfidence < 0.5);
     return list;
-  }, [activeView, languageFilter, riskFilter, intentFilter]);
+  }, [queries, activeView, languageFilter, riskFilter]);
+
+  const kpis = useMemo(() => {
+    const total = queries.length;
+    const highRisk = queries.filter(
+      (q) => q.riskTag === "highRisk" || q.riskTag === "fraud" || q.riskTag === "refund"
+    ).length;
+    const avgConfidence =
+      total > 0
+        ? Math.round(
+            (queries.reduce((s, q) => s + q.intentConfidence, 0) / total) * 100
+          )
+        : 0;
+    return [
+      {
+        key: "unresolved",
+        label: "Unresolved bot queries",
+        value: total,
+        icon: MessageSquareOff,
+        colorClass: "from-violet-500/20 to-violet-600/5 border-violet-500/30 text-violet-600 dark:text-violet-400",
+        delay: 0,
+      },
+      {
+        key: "highRisk",
+        label: "High-risk / Escalated",
+        value: highRisk,
+        icon: AlertTriangle,
+        colorClass: "from-amber-500/20 to-orange-600/5 border-amber-500/30 text-amber-600 dark:text-amber-400",
+        delay: 0.05,
+      },
+      {
+        key: "confidence",
+        label: "Avg bot confidence score",
+        value: `${avgConfidence}%`,
+        icon: Gauge,
+        colorClass: "from-emerald-500/20 to-emerald-600/5 border-emerald-500/30 text-emerald-600 dark:text-emerald-400",
+        delay: 0.1,
+      },
+    ];
+  }, [queries]);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-background via-background to-muted/20">
@@ -313,9 +233,9 @@ export default function DashboardPage() {
           </p>
         </motion.div>
 
-        {/* KPI Cards */}
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-          {KPIS.map((kpi, i) => (
+        {/* KPI Cards (derived from API data) */}
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {kpis.map((kpi) => (
             <motion.div
               key={kpi.key}
               initial={{ opacity: 0, y: 20 }}
@@ -336,7 +256,6 @@ export default function DashboardPage() {
                 </CardHeader>
                 <CardContent>
                   <div className="text-2xl font-bold">{kpi.value}</div>
-                  <p className="text-xs text-muted-foreground">{kpi.trend}</p>
                 </CardContent>
               </Card>
             </motion.div>
@@ -386,12 +305,48 @@ export default function DashboardPage() {
                   <SelectItem value="refund">Refund</SelectItem>
                   <SelectItem value="fraud">Fraud</SelectItem>
                   <SelectItem value="safety">Safety</SelectItem>
+                  <SelectItem value="highRisk">High Risk</SelectItem>
                 </SelectContent>
               </Select>
+              <div className="flex items-center gap-2">
+                <Input
+                  placeholder="Driver ID"
+                  className="w-[120px]"
+                  value={driverIdFilter}
+                  onChange={(e) => setDriverIdFilter(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && loadQueries()}
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={loadQueries}
+                  disabled={loading}
+                >
+                  {loading ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-3.5 w-3.5" />
+                  )}
+                </Button>
+              </div>
             </div>
           </div>
 
           <TabsContent value="queue" className="space-y-4">
+            {error && (
+              <Alert variant="destructive">
+                <AlertTriangle className="h-4 w-4" />
+                <AlertDescription>{error}</AlertDescription>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="ml-auto"
+                  onClick={loadQueries}
+                >
+                  Retry
+                </Button>
+              </Alert>
+            )}
             <motion.div
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
@@ -401,9 +356,18 @@ export default function DashboardPage() {
                 <h2 className="font-semibold">Bot Failure Queue</h2>
                 <p className="text-sm text-muted-foreground">
                   Each row is a driver query the bot couldn&apos;t resolve. Click
-                  to open detail.
+                  to open detail. Data from <code className="text-xs">/api/queries</code>
+                  {driverIdFilter.trim() && (
+                    <> · filtered by driver <strong>{driverIdFilter.trim()}</strong></>
+                  )}
                 </p>
               </div>
+              {loading && queries.length === 0 ? (
+                <div className="flex h-[420px] items-center justify-center gap-2 text-muted-foreground">
+                  <Loader2 className="h-5 w-5 animate-spin" />
+                  <span>Loading queries…</span>
+                </div>
+              ) : (
               <ScrollArea className="h-[420px]">
                 <Table>
                   <TableHeader>
@@ -488,6 +452,7 @@ export default function DashboardPage() {
                   </TableBody>
                 </Table>
               </ScrollArea>
+              )}
             </motion.div>
           </TabsContent>
 
@@ -499,60 +464,29 @@ export default function DashboardPage() {
             >
               <Card>
                 <CardHeader>
-                  <CardTitle>Bot containment rate</CardTitle>
-                  <CardDescription>Last 7 days</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  <div className="flex items-baseline gap-2">
-                    <span className="text-3xl font-bold">78%</span>
-                    <span className="text-muted-foreground">↑ 4%</span>
-                  </div>
-                  <Progress value={78} className="mt-2 h-2" />
-                </CardContent>
-              </Card>
-              <Card>
-                <CardHeader>
                   <CardTitle>Top failure intents</CardTitle>
-                  <CardDescription>Why bot failed</CardDescription>
+                  <CardDescription>From current query set</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-2">
-                  {["Check Swap History", "Refund Request", "Battery Booking", "SIM Change"].map(
-                    (intent, i) => (
-                      <div
-                        key={intent}
-                        className="flex justify-between text-sm"
-                      >
+                  {(() => {
+                    const byIntent = queries.reduce<Record<string, number>>((acc, q) => {
+                      acc[q.intentPredicted] = (acc[q.intentPredicted] ?? 0) + 1;
+                      return acc;
+                    }, {});
+                    const total = queries.length;
+                    const entries = Object.entries(byIntent).sort((a, b) => b[1] - a[1]);
+                    if (entries.length === 0) {
+                      return <p className="text-sm text-muted-foreground">No data</p>;
+                    }
+                    return entries.map(([intent, count]) => (
+                      <div key={intent} className="flex justify-between text-sm">
                         <span>{intent}</span>
                         <span className="text-muted-foreground">
-                          {[42, 28, 18, 12][i]}%
+                          {total ? Math.round((count / total) * 100) : 0}%
                         </span>
                       </div>
-                    )
-                  )}
-                </CardContent>
-              </Card>
-              <Card>
-                <CardHeader>
-                  <CardTitle>Avg agent handling time</CardTitle>
-                  <CardDescription>AHT</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  <div className="text-3xl font-bold">4m 32s</div>
-                  <p className="text-sm text-muted-foreground">
-                    Target: 5m — within SLA
-                  </p>
-                </CardContent>
-              </Card>
-              <Card>
-                <CardHeader>
-                  <CardTitle>Query repeat rate</CardTitle>
-                  <CardDescription>Same driver, same day</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  <div className="text-3xl font-bold">12%</div>
-                  <p className="text-sm text-muted-foreground">
-                    Agent vs bot resolution: 65% / 35%
-                  </p>
+                    ));
+                  })()}
                 </CardContent>
               </Card>
             </motion.div>
@@ -571,6 +505,9 @@ export default function DashboardPage() {
             <QueryDetailPanel
               query={selectedQuery}
               onClose={() => setSelectedQuery(null)}
+              onResolve={(q) => {
+                setQueries((prev) => prev.filter((x) => x.id !== q.id));
+              }}
             />
           )}
         </SheetContent>
@@ -582,10 +519,17 @@ export default function DashboardPage() {
 function QueryDetailPanel({
   query,
   onClose,
+  onResolve,
 }: {
   query: QueryRecord;
   onClose: () => void;
+  onResolve?: (query: QueryRecord) => void;
 }) {
+  const handleResolve = () => {
+    onResolve?.(query);
+    onClose();
+  };
+
   return (
     <div className="space-y-6 pb-12">
       <SheetHeader>
@@ -598,194 +542,20 @@ function QueryDetailPanel({
         </SheetDescription>
       </SheetHeader>
 
-      {/* A. Driver Utterance */}
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium text-muted-foreground">
-            Driver utterance
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-2">
-          <p className="rounded-md bg-muted/50 p-3 font-mono text-sm">
-            &ldquo;{query.rawText}&rdquo;
-          </p>
-          <div className="flex flex-wrap gap-2 text-xs">
-            <Badge variant="outline">{query.language}</Badge>
-            {query.translatedText && (
-              <span className="text-muted-foreground">
-                → {query.translatedText}
-              </span>
-            )}
-            {query.voiceConfidence != null && (
-              <span>
-                Voice transcript confidence:{" "}
-                <span className={getConfidenceColor(query.voiceConfidence)}>
-                  {Math.round(query.voiceConfidence * 100)}%
-                </span>
-              </span>
-            )}
-          </div>
-        </CardContent>
-      </Card>
+      <p className="rounded-md bg-muted/50 p-4 text-sm leading-relaxed">
+        {query.rawText}
+      </p>
 
-      {/* B. Bot Analysis Breakdown */}
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium text-muted-foreground">
-            Bot analysis breakdown
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div>
-            <span className="text-muted-foreground">Detected intent: </span>
-            <span className="font-medium">{query.intentPredicted}</span>
-            <span
-              className={cn(
-                "ml-2 font-medium",
-                getConfidenceColor(query.intentConfidence)
-              )}
-            >
-              {Math.round(query.intentConfidence * 100)}%{" "}
-              {query.intentConfidence < 0.5 && "❌"}
-            </span>
-          </div>
-          <div>
-            <p className="text-muted-foreground mb-1">Extracted entities:</p>
-            <ul className="list-inside list-disc space-y-0.5 text-sm">
-              {Object.entries(query.entities).map(([k, v]) => (
-                <li key={k}>
-                  {k}: {v || "missing ❌"}
-                </li>
-              ))}
-              {Object.keys(query.entities).length === 0 && (
-                <li className="text-muted-foreground">None</li>
-              )}
-            </ul>
-          </div>
-          <p className="text-sm text-muted-foreground">
-            Failure reason: {query.failureReason}
-          </p>
-        </CardContent>
-      </Card>
-
-      {/* Risk & Fraud (if applicable) */}
-      {query.riskScore != null && query.riskScore >= 50 && (
-        <Card className="border-amber-500/40 bg-amber-500/5">
-          <CardHeader className="pb-2">
-            <CardTitle className="flex items-center gap-2 text-sm text-amber-700 dark:text-amber-400">
-              <ShieldAlert className="h-4 w-4" />
-              Risk & fraud signals
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-2">
-            <div className="flex items-center gap-2">
-              <span className="font-semibold">Risk score: </span>
-              <span
-                className={cn(
-                  query.riskScore >= 70
-                    ? "text-red-600 dark:text-red-400"
-                    : "text-amber-600 dark:text-amber-400"
-                )}
-              >
-                {query.riskScore} / 100 🔴
-              </span>
-            </div>
-            <ul className="text-sm text-muted-foreground">
-              <li>Synthetic voice probability: High</li>
-              <li>Device mismatch</li>
-              <li>Unusual refund frequency</li>
-            </ul>
-            <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
-              Step-up verification. Do NOT issue refund directly.
-            </p>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* C. Suggested Agent Actions (Agent Assist) */}
-      {(query.suggestedIntent ||
-        query.suggestedFollowUps?.length ||
-        query.deepLinks?.length) && (
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
-              Suggested agent actions
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {query.suggestedIntent && (
-              <p>
-                <span className="text-muted-foreground">Likely intent: </span>
-                {query.suggestedIntent}
-              </p>
-            )}
-            {query.suggestedFollowUps && query.suggestedFollowUps.length > 0 && (
-              <div>
-                <p className="text-muted-foreground mb-1">Suggested follow-up:</p>
-                <ul className="list-inside list-disc text-sm">
-                  {query.suggestedFollowUps.map((s) => (
-                    <li key={s}>&ldquo;{s}&rdquo;</li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {query.deepLinks && query.deepLinks.length > 0 && (
-              <div className="flex flex-wrap gap-2">
-                {query.deepLinks.map((link) => (
-                  <Button key={link.label} variant="outline" size="sm" asChild>
-                    <a href={link.href}>
-                      <ArrowUpRight className="mr-1 h-3.5 w-3.5" />
-                      {link.label}
-                    </a>
-                  </Button>
-                ))}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      )}
-
-      <Separator />
-
-      {/* Agent Actions */}
-      <div className="space-y-2">
-        <p className="text-sm font-medium text-muted-foreground">
-          Agent actions
-        </p>
-        <div className="flex flex-wrap gap-2">
-          <Button variant="default" size="sm" className="bg-emerald-600 hover:bg-emerald-700">
-            <CheckCircle2 className="mr-1 h-4 w-4" />
-            Resolve & Close
-          </Button>
-          <Button variant="secondary" size="sm">
-            <Send className="mr-1 h-4 w-4" />
-            Request Info (SMS / App)
-          </Button>
-          <Button variant="destructive" size="sm">
-            <ArrowUpRight className="mr-1 h-4 w-4" />
-            Escalate to Tier-2
-          </Button>
-          <Button variant="outline" size="sm">
-            <Database className="mr-1 h-4 w-4" />
-            Mark as Bot Training Data
-          </Button>
-        </div>
+      <div className="flex flex-wrap gap-2">
+        <Button
+          onClick={handleResolve}
+          size="sm"
+          className="bg-emerald-600 hover:bg-emerald-700"
+        >
+          <CheckCircle2 className="mr-2 h-4 w-4" />
+          Resolve
+        </Button>
       </div>
-
-      {/* Bot Learning feedback (short) */}
-      <Card className="bg-muted/30">
-        <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium text-muted-foreground">
-            Bot learning — feedback
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-2 text-sm">
-          <p>Correct intent? Missing entity? New intent? Query quality rating.</p>
-          <Button variant="outline" size="sm">
-            Submit feedback
-          </Button>
-        </CardContent>
-      </Card>
     </div>
   );
 }
